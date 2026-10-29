@@ -15,7 +15,7 @@ type OAuthFlowLoaders = {
 	anthropic: () => OAuthAuth | Promise<OAuthAuth>;
 	openaiCodex: () => OAuthAuth | Promise<OAuthAuth>;
 	openaiChatGPT: () => OAuthAuth | Promise<OAuthAuth>;
-	githubCopilot: () => OAuthAuth | Promise<OAuthAuth>;
+	githubCopilot: (modelCatalogTimeoutMs: number) => OAuthAuth | Promise<OAuthAuth>;
 	openrouter: () => OAuthAuth | Promise<OAuthAuth>;
 	kimiCoding: () => OAuthAuth | Promise<OAuthAuth>;
 	meta: () => OAuthAuth | Promise<OAuthAuth>;
@@ -45,9 +45,13 @@ export const loadOpenAIChatGPTOAuth = async (): Promise<OAuthAuth> => {
 	return ((await importOAuthModule("./openai-chatgpt.ts")) as { openaiChatGPTOAuth: OAuthAuth }).openaiChatGPTOAuth;
 };
 
-export const loadGitHubCopilotOAuth = async (): Promise<OAuthAuth> => {
-	if (bundledLoaders) return bundledLoaders.githubCopilot();
-	return ((await importOAuthModule("./github-copilot.ts")) as { githubCopilotOAuth: OAuthAuth }).githubCopilotOAuth;
+export const loadGitHubCopilotOAuth = async (modelCatalogTimeoutMs: number): Promise<OAuthAuth> => {
+	if (bundledLoaders) return bundledLoaders.githubCopilot(modelCatalogTimeoutMs);
+	// The variable specifier hides this internal module's known exports from TypeScript.
+	const module = (await importOAuthModule("./github-copilot.ts")) as {
+		createGitHubCopilotOAuth: (modelCatalogTimeoutMs: number) => OAuthAuth;
+	};
+	return module.createGitHubCopilotOAuth(modelCatalogTimeoutMs);
 };
 
 export const loadOpenRouterOAuth = async (): Promise<OAuthAuth> => {

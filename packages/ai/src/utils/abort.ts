@@ -1,3 +1,11 @@
+/** Validate a finite, positive timeout supported by native timers. */
+export function validateTimeoutMs(value: unknown, name: string): number {
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > 2_147_483_647) {
+		throw new RangeError(`Invalid ${name}: expected an integer from 1 to 2147483647 milliseconds`);
+	}
+	return value;
+}
+
 function abortReason(signal: AbortSignal): unknown {
 	if (signal.reason !== undefined) return signal.reason;
 	const error = new Error("The operation was aborted");

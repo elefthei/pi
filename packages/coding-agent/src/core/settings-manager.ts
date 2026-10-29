@@ -1,5 +1,6 @@
 import type { ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { Model } from "@earendil-works/pi-ai";
+import { validateTimeoutMs } from "@earendil-works/pi-ai/utils/abort";
 import type { ScrollViewScrollbar, TerminalCapabilities, WheelScrollLines } from "@earendil-works/pi-tui";
 import { randomUUID } from "crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
@@ -961,6 +962,20 @@ export class SettingsManager {
 
 	getWebSocketConnectTimeoutMs(): number | undefined {
 		return parseTimeoutSetting(this.settings.websocketConnectTimeoutMs, "websocketConnectTimeoutMs");
+	}
+
+	getOAuthRefreshTimeoutMs(): number {
+		const value = this.settings.oauthRefreshTimeoutMs;
+		return value === undefined
+			? SETTINGS_DEFAULTS.oauthRefreshTimeoutMs
+			: validateTimeoutMs(value, "oauthRefreshTimeoutMs setting");
+	}
+
+	getGitHubCopilotModelsTimeoutMs(): number {
+		const value = this.settings.githubCopilotModelsTimeoutMs;
+		return value === undefined
+			? SETTINGS_DEFAULTS.githubCopilotModelsTimeoutMs
+			: validateTimeoutMs(value, "githubCopilotModelsTimeoutMs setting");
 	}
 
 	getHideThinkingBlock(): boolean {

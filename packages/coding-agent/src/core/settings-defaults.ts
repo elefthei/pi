@@ -58,6 +58,8 @@ export const SETTINGS_DEFAULTS = {
 		mode: "on",
 		inlineBudget: 3000,
 	},
+	oauthRefreshTimeoutMs: 15_000,
+	githubCopilotModelsTimeoutMs: 5_000,
 	cacheWarming: "streaming",
 	tuiMode: "fullscreen",
 	fullscreenExitOutput: "transcript",

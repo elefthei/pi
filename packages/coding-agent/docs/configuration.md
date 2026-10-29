@@ -4,6 +4,8 @@ Pi supports user-level and project configuration. User-level configuration lives
 
 In interactive mode, use `/settings` to change common preferences. For other options, ask Pi to update the configuration or edit the relevant files directly. Run `/reload` after manually changing settings, keybindings, instructions, or resources.
 
+`oauthRefreshTimeoutMs` and `githubCopilotModelsTimeoutMs` are construction-time settings: restart Pi after changing agent-directory values. `/reload` and later project-trust grants do not change an existing runtime's deadlines. The CLI normally resolves even saved project trust after runtime construction, so restart alone does not apply project deadline values. Use `pi --approve` only for a project you trust to admit its settings before construction, or keep these deadlines in agent-directory settings.
+
 ## Agent directory
 
 The agent directory is shown as `<agent-dir>` below. Set its location with the `PI_CODING_AGENT_DIR` environment variable or the SDK's [`agentDir`](sdk.md) option.

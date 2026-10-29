@@ -692,6 +692,20 @@
       ],
       "description": "WebSocket connect or open handshake timeout in milliseconds; 0 or \"disabled\" disables it."
     },
+    "oauthRefreshTimeoutMs": {
+      "type": "integer",
+      "description": "OAuth refresh deadline in milliseconds, captured when the model runtime is constructed.",
+      "minimum": 1,
+      "maximum": 2147483647,
+      "default": 15000
+    },
+    "githubCopilotModelsTimeoutMs": {
+      "type": "integer",
+      "description": "GitHub Copilot model catalog deadline in milliseconds, captured when the model runtime is constructed.",
+      "minimum": 1,
+      "maximum": 2147483647,
+      "default": 5000
+    },
     "tuiMode": {
       "anyOf": [
         {

@@ -55,7 +55,7 @@ import type {
 	TranscriptContext,
 	Usage,
 } from "./types.ts";
-import { operationSignal, raceWithAbortSignal } from "./utils/abort.ts";
+import { operationSignal, raceWithAbortSignal, validateTimeoutMs } from "./utils/abort.ts";
 import { type ClientIdentity, getOpenCodeSessionHeaders, mergeClientIdentity } from "./utils/identity.ts";
 import {
 	assertChatModel,
@@ -377,6 +377,8 @@ export interface CreateModelsOptions {
 	credentials?: CredentialStore;
 	modelsStore?: ModelsStore;
 	authContext?: AuthContext;
+	/** Deadline for each started OAuth refresh, including rotated-token persistence; defaults to 15 seconds. */
+	oauthRefreshTimeoutMs?: number;
 	/** Default identity of every request; a request's `identity` overrides it field by field. */
 	identity?: ClientIdentity;
 }
@@ -403,11 +405,16 @@ class ModelsImpl implements MutableModels {
 	private modelsStore: ModelsStore;
 	private authContext: AuthContext;
 	private identity: ClientIdentity | undefined;
+	private oauthRefreshTimeoutMs: number;
 	private refreshGenerations = new Map<string, number>();
 	private refreshControllers = new Map<string, AbortController>();
 	private publicationChains = new Map<string, Promise<unknown>>();
 
 	constructor(options?: CreateModelsOptions) {
+		this.oauthRefreshTimeoutMs =
+			options?.oauthRefreshTimeoutMs === undefined
+				? 15_000
+				: validateTimeoutMs(options.oauthRefreshTimeoutMs, "oauthRefreshTimeoutMs");
 		this.credentials = options?.credentials ?? new InMemoryCredentialStore();
 		this.modelsStore = options?.modelsStore ?? new InMemoryModelsStore();
 		this.authContext = options?.authContext ?? defaultAuthContext();
@@ -642,6 +649,7 @@ class ModelsImpl implements MutableModels {
 				oauth,
 				(current) => Date.now() >= current.expires,
 				signal,
+				this.oauthRefreshTimeoutMs,
 			);
 		}
 
@@ -683,7 +691,13 @@ class ModelsImpl implements MutableModels {
 			}
 		}
 
-		const resolution = await resolveProviderAuth(provider, this.credentials, this.authContext, { signal });
+		const resolution = await resolveProviderAuth(
+			provider,
+			this.credentials,
+			this.authContext,
+			{ signal },
+			this.oauthRefreshTimeoutMs,
+		);
 		return resolution ? { source: resolution.source, type: "api_key" } : undefined;
 	}
 
@@ -761,7 +775,13 @@ class ModelsImpl implements MutableModels {
 		const providerId = typeof providerOrModel === "string" ? providerOrModel : providerOrModel.provider;
 		const provider = this.providers.get(providerId);
 		if (!provider) return undefined;
-		const result = await resolveProviderAuth(provider, this.credentials, this.authContext, { ...overrides, signal });
+		const result = await resolveProviderAuth(
+			provider,
+			this.credentials,
+			this.authContext,
+			{ ...overrides, signal },
+			this.oauthRefreshTimeoutMs,
+		);
 		if (!result || typeof providerOrModel === "string" || !providerOrModel.headers) return result;
 		return {
 			...result,

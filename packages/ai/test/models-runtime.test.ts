@@ -1,6 +1,6 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
-import type { ApiKeyAuth, CredentialStore, OAuthAuth, ProviderAuth } from "../src/auth/types.ts";
+import type { ApiKeyAuth, CredentialStore, OAuthAuth, OAuthCredential, ProviderAuth } from "../src/auth/types.ts";
 import { calculateCost, createModels, createProvider, hasApi, type Provider } from "../src/models.ts";
 import { InMemoryModelsStore, type ModelsStore, type ModelsStoreEntry } from "../src/models-store.ts";
 import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, StreamOptions, Usage } from "../src/types.ts";
@@ -534,6 +534,158 @@ describe("Models runtime", () => {
 		expect((await models.refresh({ signal: controller.signal })).aborted).toBe(true);
 		await vi.waitFor(async () => {
 			expect(await credentials.read("p1")).toMatchObject({ refresh: "new-refresh" });
+		});
+	});
+
+	// Regression: https://github.com/earendil-works/pi/issues/11549
+	describe("refresh OAuth-owned deadlines", () => {
+		beforeEach(() => {
+			vi.useFakeTimers();
+			vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+				const controller = new AbortController();
+				setTimeout(
+					() => controller.abort(new DOMException("OAuth refresh timed out", "TimeoutError")),
+					milliseconds,
+				);
+				return controller.signal;
+			});
+		});
+
+		afterEach(() => {
+			vi.clearAllTimers();
+			vi.restoreAllMocks();
+			vi.useRealTimers();
+		});
+
+		async function createRefreshRuntime(oauthRefreshTimeoutMs?: number) {
+			const credentials = new InMemoryCredentialStore();
+			const expired: OAuthCredential = { type: "oauth", access: "old", refresh: "old-refresh", expires: 0 };
+			await credentials.modify("p1", async () => expired);
+			let markStarted: (() => void) | undefined;
+			const started = new Promise<void>((resolve) => {
+				markStarted = resolve;
+			});
+			const refresh = vi.fn(
+				(credential: OAuthCredential, signal: AbortSignal) =>
+					new Promise<OAuthCredential>((resolve, reject) => {
+						const timer = setTimeout(() => {
+							signal.removeEventListener("abort", abort);
+							resolve({ ...credential, access: "new", refresh: "new-refresh", expires: Date.now() + 60_000 });
+						}, 16_000);
+						const abort = () => {
+							clearTimeout(timer);
+							reject(signal.reason);
+						};
+						signal.addEventListener("abort", abort, { once: true });
+						markStarted?.();
+					}),
+			);
+			const catalog = vi.fn(async (credential: unknown) => {
+				expect(await credentials.read("p1")).toEqual(credential);
+			});
+			const models = createModels({ credentials, oauthRefreshTimeoutMs });
+			models.setProvider(
+				testProvider({
+					id: "p1",
+					auth: { oauth: testOAuth({ refresh }) },
+					refreshModels: async ({ allowNetwork, credential }) => {
+						if (allowNetwork) await catalog(credential);
+					},
+				}),
+			);
+			return { credentials, expired, models, refresh, catalog, started };
+		}
+
+		it("reports the default 15-second OAuth deadline as a provider error without fetching the catalog", async () => {
+			const { credentials, expired, models, catalog, started } = await createRefreshRuntime();
+			let settled = false;
+			const pending = models.refresh().then((result) => {
+				settled = true;
+				return result;
+			});
+			await started;
+			await vi.advanceTimersByTimeAsync(14_999);
+			expect(settled).toBe(false);
+			expect(catalog).not.toHaveBeenCalled();
+
+			await vi.advanceTimersByTimeAsync(1);
+			const result = await pending;
+			expect(result.aborted).toBe(false);
+			expect(result.errors.size).toBe(1);
+			expect(result.errors.get("p1")).toMatchObject({ code: "oauth", cause: { name: "TimeoutError" } });
+			expect(catalog).not.toHaveBeenCalled();
+			expect(await credentials.read("p1")).toEqual(expired);
+		});
+
+		it("persists a 16-second OAuth refresh before fetching the catalog with a 30-second deadline", async () => {
+			const { credentials, models, refresh, catalog, started } = await createRefreshRuntime(30_000);
+			const pending = models.refresh();
+			await started;
+			await vi.advanceTimersByTimeAsync(15_999);
+			expect(catalog).not.toHaveBeenCalled();
+			expect(await credentials.read("p1")).toMatchObject({ refresh: "old-refresh" });
+
+			await vi.advanceTimersByTimeAsync(1);
+			const result = await pending;
+			expect(result.aborted).toBe(false);
+			expect(result.errors.size).toBe(0);
+			expect(refresh).toHaveBeenCalledOnce();
+			expect(catalog).toHaveBeenCalledExactlyOnceWith(
+				expect.objectContaining({ access: "new", refresh: "new-refresh" }),
+			);
+			expect(await credentials.read("p1")).toMatchObject({ access: "new", refresh: "new-refresh" });
+		});
+
+		it("returns promptly on caller cancellation but persists the started refresh and releases its lock", async () => {
+			const { credentials, expired, models, refresh, catalog, started } = await createRefreshRuntime(30_000);
+			const controller = new AbortController();
+			const pending = models.refresh({ signal: controller.signal });
+			await started;
+			controller.abort();
+
+			const result = await pending;
+			expect(result.aborted).toBe(true);
+			expect(result.errors.size).toBe(0);
+			expect(await credentials.read("p1")).toEqual(expired);
+			expect(refresh.mock.calls[0]?.[1].aborted).toBe(false);
+			await vi.advanceTimersByTimeAsync(16_000);
+			const stored = await credentials.modify("p1", async (credential) => {
+				expect(credential).toMatchObject({ access: "new", refresh: "new-refresh" });
+				return credential;
+			});
+			expect(stored).toMatchObject({ access: "new", refresh: "new-refresh" });
+			expect(refresh).toHaveBeenCalledOnce();
+			expect(catalog).not.toHaveBeenCalled();
+		});
+
+		it("does not start OAuth refresh when cancelled while waiting for the credential lock", async () => {
+			const { credentials, expired, models, refresh, catalog } = await createRefreshRuntime(30_000);
+			let releaseLock: (() => void) | undefined;
+			const blocked = new Promise<void>((resolve) => {
+				releaseLock = resolve;
+			});
+			const holdingLock = credentials.modify("p1", async () => {
+				await blocked;
+				return expired;
+			});
+			const modify = vi.spyOn(credentials, "modify");
+			const controller = new AbortController();
+			const pending = models.refresh({ signal: controller.signal });
+			await vi.advanceTimersByTimeAsync(0);
+			expect(modify).toHaveBeenCalledOnce();
+			expect(refresh).not.toHaveBeenCalled();
+			controller.abort();
+
+			const result = await pending;
+			expect(result.aborted).toBe(true);
+			expect(result.errors.size).toBe(0);
+			releaseLock?.();
+			await holdingLock;
+			await vi.advanceTimersByTimeAsync(0);
+			expect(refresh).not.toHaveBeenCalled();
+			expect(AbortSignal.timeout).not.toHaveBeenCalled();
+			expect(catalog).not.toHaveBeenCalled();
+			expect(await credentials.read("p1")).toEqual(expired);
 		});
 	});
 

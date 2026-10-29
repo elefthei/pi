@@ -63,9 +63,14 @@ export async function getProviderCredential(
 	return getAuthCredential(await modelRuntime.getAuth(providerId));
 }
 
-export async function createAuthCheckModelRuntime(credentials: CredentialStore): Promise<ModelRuntime> {
+export async function createAuthCheckModelRuntime(
+	credentials: CredentialStore,
+	options?: { oauthRefreshTimeoutMs?: number; githubCopilotModelsTimeoutMs?: number },
+): Promise<ModelRuntime> {
 	return ModelRuntime.create({
 		credentials,
+		oauthRefreshTimeoutMs: options?.oauthRefreshTimeoutMs,
+		githubCopilotModelsTimeoutMs: options?.githubCopilotModelsTimeoutMs,
 		modelsStore: new InMemoryCodingAgentModelsStore(),
 		allowModelNetwork: false,
 		refreshOnCreate: false,

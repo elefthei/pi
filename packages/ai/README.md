@@ -273,7 +273,7 @@ import { builtinModels } from '@earendil-works/pi-ai/providers/all';
 const models = builtinModels(); // a Models collection with every built-in provider registered
 ```
 
-This imports all catalogs and every built-in provider factory. It is the heavy, explicit entrypoint. `builtinModels()` accepts the same options as `createModels()` (`credentials`, `authContext`); `builtinProviders()` returns the provider array if you want to register them on your own collection.
+This imports all catalogs and every built-in provider factory. It is the heavy, explicit entrypoint. `builtinModels()` accepts the same options as `createModels()`, plus provider options such as `githubCopilot`; `builtinProviders()` accepts provider options and returns the provider array if you want to register them on your own collection.
 
 ### Querying Models
 
@@ -470,6 +470,19 @@ const models = createModels({ credentials: myFileBackedStore });
 ```
 
 The contract is small: `read(providerId)`, `list()` for non-secret `{ providerId, type }` metadata, `modify(providerId, fn)` (the only write path — a serialized read-modify-write), and `delete(providerId)`. Each operation accepts optional cancellation options. Enumeration must not resolve secrets or execute configured key commands. OAuth token refresh runs inside `modify`, so concurrent requests and processes cannot double-refresh a rotated token. A stored credential *owns* its provider: environment variables are only consulted when nothing is stored, and a failed refresh never silently falls back to an env key.
+
+Configure refresh and Copilot catalog deadlines at construction, without changing their defaults of `15_000` and `5_000` milliseconds:
+
+```typescript
+import { githubCopilotProvider } from '@earendil-works/pi-ai/providers/github-copilot';
+
+const models = createModels({ credentials: myFileBackedStore, oauthRefreshTimeoutMs: 90_000 });
+models.setProvider(githubCopilotProvider({ modelCatalogTimeoutMs: 60_000 }));
+// Or: builtinModels({ credentials: myFileBackedStore, oauthRefreshTimeoutMs: 90_000,
+//   githubCopilot: { modelCatalogTimeoutMs: 60_000 } });
+```
+
+Both options require integers from `1` to `2147483647` milliseconds and cannot disable the deadline. The OAuth deadline starts after lock acquisition and the expiry recheck, and covers token exchange and catalog loading; it may need to exceed the catalog limit. Caller cancellation stops waiting or cancels lock acquisition, but a started refresh continues under its own deadline so rotated tokens can be persisted. The catalog limit includes response-body consumption and is also login's catalog retry budget. Policy-update and inference limits are unchanged. Each collection/provider captures its own limits; construct new instances to change them.
 
 API-key credentials use the same discriminator as pi's `auth.json` and can carry provider-scoped env/config values:
 

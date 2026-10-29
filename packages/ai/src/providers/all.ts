@@ -12,7 +12,7 @@ import { cloudflareWorkersAIProvider } from "./cloudflare-workers-ai.ts";
 import modelDataManifest from "./data/.manifest.json" with { type: "json" };
 import { deepseekProvider } from "./deepseek.ts";
 import { fireworksProvider } from "./fireworks.ts";
-import { githubCopilotProvider } from "./github-copilot.ts";
+import { type GitHubCopilotProviderOptions, githubCopilotProvider } from "./github-copilot.ts";
 import { googleProvider } from "./google.ts";
 import { googleVertexProvider } from "./google-vertex.ts";
 import { groqProvider } from "./groq.ts";
@@ -132,8 +132,14 @@ export function getAllBuiltinModels<TProvider extends BuiltinProvider>(provider:
 	return [...getBuiltinModels(provider), ...getBuiltinImageModels(provider), ...getBuiltinClassifierModels(provider)];
 }
 
+export interface BuiltinProvidersOptions {
+	githubCopilot?: GitHubCopilotProviderOptions;
+}
+
+export interface BuiltinModelsOptions extends CreateModelsOptions, BuiltinProvidersOptions {}
+
 /** All built-in providers, freshly constructed. */
-export function builtinProviders(): Provider[] {
+export function builtinProviders(options?: BuiltinProvidersOptions): Provider[] {
 	return [
 		amazonBedrockProvider(),
 		antLingProvider(),
@@ -145,7 +151,7 @@ export function builtinProviders(): Provider[] {
 		cloudflareWorkersAIProvider(),
 		deepseekProvider(),
 		fireworksProvider(),
-		githubCopilotProvider(),
+		githubCopilotProvider(options?.githubCopilot),
 		googleProvider(),
 		googleVertexProvider(),
 		groqProvider(),
@@ -181,9 +187,9 @@ export function builtinProviders(): Provider[] {
 }
 
 /** A `Models` collection with every built-in provider registered. */
-export function builtinModels(options?: CreateModelsOptions): MutableModels {
+export function builtinModels(options?: BuiltinModelsOptions): MutableModels {
 	const models = createModels(options);
-	for (const provider of builtinProviders()) {
+	for (const provider of builtinProviders(options)) {
 		models.setProvider(provider);
 	}
 	return models;

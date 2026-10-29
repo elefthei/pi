@@ -159,9 +159,18 @@ async function runAuthCommand(args: string[]): Promise<boolean> {
 		if (parsed.diagnostics.length > 0) {
 			throw new AuthCommandError(parsed.diagnostics.map((diagnostic) => diagnostic.message).join("\n"));
 		}
+		const requestedAuth = validateAuthCommandArgs(parsed, command.kind);
+		const settingsManager = SettingsManager.create(getAgentDir(), getAgentDir(), { projectTrusted: false });
+		const oauthRefreshTimeoutMs = settingsManager.getOAuthRefreshTimeoutMs();
+		const githubCopilotModelsTimeoutMs = settingsManager.getGitHubCopilotModelsTimeoutMs();
 		if (command.kind !== "check") {
-			const signal = AbortSignal.timeout(15_000);
-			const modelRuntime = await ModelRuntime.create({ allowModelNetwork: false, signal });
+			const signal = AbortSignal.timeout(oauthRefreshTimeoutMs);
+			const modelRuntime = await ModelRuntime.create({
+				allowModelNetwork: false,
+				signal,
+				oauthRefreshTimeoutMs,
+				githubCopilotModelsTimeoutMs,
+			});
 			const credential = await resolveCredentialForPrint(
 				parsed,
 				modelRuntime,
@@ -173,12 +182,14 @@ async function runAuthCommand(args: string[]): Promise<boolean> {
 			return true;
 		}
 
-		const requestedAuth = validateAuthCommandArgs(parsed, command.kind);
 		let result: AuthCheckResult;
 		let credential: string | undefined;
 		try {
 			const credentials = command.noRefresh ? new ReadOnlyAuthStorage() : AuthStorage.create();
-			const modelRuntime = await createAuthCheckModelRuntime(credentials);
+			const modelRuntime = await createAuthCheckModelRuntime(credentials, {
+				oauthRefreshTimeoutMs,
+				githubCopilotModelsTimeoutMs,
+			});
 			result = await checkProviderAuth(parsed, modelRuntime, { refresh: !command.noRefresh });
 			if (command.credentials && result.status === "ready") {
 				credential = await getProviderCredential(result.provider, modelRuntime, credentials, {

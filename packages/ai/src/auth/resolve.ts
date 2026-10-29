@@ -35,10 +35,11 @@ export function resolveProviderAuth(
 	credentials: CredentialStore,
 	authContext: AuthContext,
 	overrides?: AuthResolutionOverrides,
+	oauthRefreshTimeoutMs = DEFAULT_OAUTH_REFRESH_TIMEOUT_MS,
 ): Promise<AuthResult | undefined> {
 	const signal = operationSignal(overrides?.signal);
 	return raceWithAbortSignal(
-		resolveProviderAuthWithSignal(provider, credentials, authContext, overrides, signal),
+		resolveProviderAuthWithSignal(provider, credentials, authContext, overrides, signal, oauthRefreshTimeoutMs),
 		signal,
 	);
 }
@@ -49,6 +50,7 @@ async function resolveProviderAuthWithSignal(
 	authContext: AuthContext,
 	overrides: AuthResolutionOverrides | undefined,
 	signal: AbortSignal,
+	oauthRefreshTimeoutMs: number,
 ): Promise<AuthResult | undefined> {
 	signal.throwIfAborted();
 	const requestAuthContext = overrides?.env ? overlayEnvAuthContext(authContext, overrides.env) : authContext;
@@ -77,6 +79,7 @@ async function resolveProviderAuthWithSignal(
 				stored,
 				signal,
 				overrides?.minOAuthValidityMs,
+				oauthRefreshTimeoutMs,
 			);
 		}
 		if (stored.type === "api_key" && provider.auth.apiKey) {
@@ -122,6 +125,7 @@ export async function refreshStoredOAuthCredential(
 	oauth: OAuthAuth,
 	needsRefresh: (credential: OAuthCredential) => boolean,
 	signal: AbortSignal,
+	oauthRefreshTimeoutMs = DEFAULT_OAUTH_REFRESH_TIMEOUT_MS,
 ): Promise<OAuthCredential | undefined> {
 	let post: Credential | undefined;
 	const lockWait = new AbortController();
@@ -137,7 +141,7 @@ export async function refreshStoredOAuthCredential(
 				if (current?.type !== "oauth") return undefined; // logged out meanwhile
 				if (!needsRefresh(current)) return undefined; // another process/request refreshed
 				try {
-					return await oauth.refresh(current, AbortSignal.timeout(DEFAULT_OAUTH_REFRESH_TIMEOUT_MS));
+					return await oauth.refresh(current, AbortSignal.timeout(oauthRefreshTimeoutMs));
 				} catch (error) {
 					throw new ModelsError("oauth", `OAuth refresh failed for ${providerId}`, { cause: error });
 				}
@@ -165,6 +169,7 @@ async function resolveStoredOAuth(
 	stored: OAuthCredential,
 	signal: AbortSignal,
 	minOAuthValidityMs?: number,
+	oauthRefreshTimeoutMs = DEFAULT_OAUTH_REFRESH_TIMEOUT_MS,
 ): Promise<AuthResult | undefined> {
 	const minimumValidityMs = Math.max(DEFAULT_OAUTH_MINIMUM_VALIDITY_MS, minOAuthValidityMs ?? 0);
 	const expiresSoon = (credential: OAuthCredential) => Date.now() + minimumValidityMs >= credential.expires;
@@ -172,7 +177,14 @@ async function resolveStoredOAuth(
 
 	if (expiresSoon(credential)) {
 		// Optimistic check said expired; the authoritative check runs under the lock.
-		const post = await refreshStoredOAuthCredential(credentials, providerId, oauth, expiresSoon, signal);
+		const post = await refreshStoredOAuthCredential(
+			credentials,
+			providerId,
+			oauth,
+			expiresSoon,
+			signal,
+			oauthRefreshTimeoutMs,
+		);
 		if (!post) return undefined; // logged out meanwhile
 		credential = post;
 		// The normal five-minute window triggers a refresh but does not impose a

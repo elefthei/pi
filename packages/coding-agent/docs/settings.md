@@ -125,6 +125,8 @@ See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and p
 | `httpProxy` | string | None | Proxy URL applied as `HTTP_PROXY` and `HTTPS_PROXY` for Pi-managed HTTP clients. **Can only be set in agent-directory settings.** |
 | `httpIdleTimeoutMs` | number \| `"disabled"` | `300000` | HTTP header and body idle timeout in milliseconds. Set to `0` or `"disabled"` to disable. |
 | `websocketConnectTimeoutMs` | number \| `"disabled"` | `15000` | WebSocket connection timeout in milliseconds. Set to `0` or `"disabled"` to disable. |
+| `oauthRefreshTimeoutMs` | integer | `15000` | Deadline for a started OAuth refresh, including token exchange and Copilot catalog loading. |
+| `githubCopilotModelsTimeoutMs` | integer | `5000` | Copilot catalog request deadline, including response bodies; also the catalog retry budget during login. |
 | `retry.enabled` | boolean | `true` | Enable automatic agent-level retry for transient failures. |
 | `retry.maxRetries` | number | `3` | Maximum agent-level retry attempts. |
 | `retry.baseDelayMs` | number | `2000` | Initial exponential-backoff delay in milliseconds. |
@@ -134,6 +136,19 @@ See [Themes](themes.md) and [Terminal Setup](terminal-setup.md) for format and p
 | `retry.provider.maxRetryDelayMs` | number | `60000` | Maximum server-requested delay in milliseconds. Set to `0` to disable the limit. |
 
 Keep `retry.provider.maxRetries` at `0` unless provider-level retries are required. Provider retries can delay Pi from handling quota and usage-limit errors itself.
+
+Both OAuth/catalog deadlines must be integers from `1` to `2147483647` milliseconds; they cannot be disabled. For example, in `~/.pi/agent/settings.json` (or `<agent-dir>/settings.json`), or trusted project `.pi/settings.json`:
+
+```json
+{
+  "oauthRefreshTimeoutMs": 90000,
+  "githubCopilotModelsTimeoutMs": 60000
+}
+```
+
+These are optional larger local limits, not new defaults. The OAuth deadline also covers the token exchange, so it may need to exceed the catalog deadline. A started refresh continues to persist rotated tokens after its caller cancels, up to its own deadline.
+
+Deadlines are captured when the model runtime is constructed. Restart Pi after changing agent-directory values; `/reload` does not reconfigure an existing runtime. In the CLI, project trust is normally resolved after runtime construction, including saved trust decisions. To apply project deadline values at startup, use `pi --approve` only for a project you trust; a saved trust decision plus restart alone is insufficient. SDK callers can supply an already-trusted `SettingsManager` before constructing a new runtime. Standalone `pi auth` commands read only agent-directory settings.
 
 ## Shell
 

@@ -216,6 +216,23 @@ describe("generated configuration schemas", () => {
 		).toBe(true);
 	});
 
+	// Regression: #11549
+	it.each(["oauthRefreshTimeoutMs", "githubCopilotModelsTimeoutMs"] as const)(
+		"validates finite positive integer %s deadlines in the generated schema",
+		(key) => {
+			const schema = JSON.parse(renderConfigSchemas().get("schemas/settings.schema.json") ?? "");
+			const validator = Compile(schema);
+			expect(validator.Check({})).toBe(true);
+			for (const value of [null, 0, -1, 0.5, "60000", "disabled", 2147483648]) {
+				expect(validator.Check({ [key]: value }), `${key}=${JSON.stringify(value)}`).toBe(false);
+			}
+			for (const value of [1, 2147483647]) {
+				expect(validator.Check({ [key]: value }), `${key}=${value}`).toBe(true);
+			}
+			expect(schema.properties[key].default).toBe(key === "oauthRefreshTimeoutMs" ? 15_000 : 5_000);
+		},
+	);
+
 	it("describes legacy settings migrations accurately", () => {
 		const schema = JSON.parse(renderConfigSchemas().get("schemas/settings.schema.json") ?? "") as {
 			properties: {

@@ -137,7 +137,7 @@ async function fetchWithRateLimitRetry(
 	url: string,
 	init: RequestInit,
 	signal: AbortSignal,
-	retryPolicy: { maxRetries: number; maxElapsedMs: number },
+	retryPolicy: { maxRetries: number; maxElapsedMs: number; attemptTimeoutMs: number },
 ): Promise<Response> {
 	const retryBudgetSignal =
 		retryPolicy.maxRetries > 0 && retryPolicy.maxElapsedMs > 0
@@ -148,7 +148,7 @@ async function fetchWithRateLimitRetry(
 	for (let retry = 0; ; retry++) {
 		const response = await fetch(url, {
 			...init,
-			signal: AbortSignal.any([requestSignal, AbortSignal.timeout(5000)]),
+			signal: AbortSignal.any([requestSignal, AbortSignal.timeout(retryPolicy.attemptTimeoutMs)]),
 		});
 		if (response.status !== 429 || retry === retryPolicy.maxRetries) return response;
 
@@ -170,7 +170,7 @@ async function fetchGitHubCopilotModels(
 	copilotToken: string,
 	enterpriseDomain: string | undefined,
 	signal: AbortSignal,
-	retryPolicy: { maxRetries: number; maxElapsedMs: number },
+	retryPolicy: { maxRetries: number; maxElapsedMs: number; attemptTimeoutMs: number },
 ) {
 	const baseUrl = getGitHubCopilotBaseUrl(copilotToken, enterpriseDomain);
 	// Some Individual accounts return false for every picker flag despite explicit enabled policies.
@@ -348,11 +348,13 @@ async function refreshGitHubCopilotToken(
 	refreshToken: string,
 	enterpriseDomain: string | undefined,
 	signal: AbortSignal,
+	modelCatalogTimeoutMs: number,
 ): Promise<OAuthCredential> {
 	const credentials = await refreshGitHubCopilotAccessToken(refreshToken, enterpriseDomain, signal);
 	const { availableModelIds } = await fetchGitHubCopilotModels(credentials.access, enterpriseDomain, signal, {
 		maxRetries: 0,
 		maxElapsedMs: 0,
+		attemptTimeoutMs: modelCatalogTimeoutMs,
 	});
 	return {
 		...credentials,
@@ -389,7 +391,7 @@ async function enableGitHubCopilotModel(
 				body: JSON.stringify({ state: "enabled" }),
 			},
 			signal,
-			{ maxRetries: 2, maxElapsedMs: 5000 },
+			{ maxRetries: 2, maxElapsedMs: 5000, attemptTimeoutMs: 5000 },
 		);
 	} catch (error) {
 		if (signal.aborted) throw error;
@@ -425,7 +427,10 @@ async function enableGitHubCopilotModels(
 	return enabledModelIds;
 }
 
-async function loginGitHubCopilot(interaction: ProviderAuthInteraction): Promise<OAuthCredential> {
+async function loginGitHubCopilot(
+	interaction: ProviderAuthInteraction,
+	modelCatalogTimeoutMs: number,
+): Promise<OAuthCredential> {
 	const input = await interaction.prompt({
 		type: "text",
 		message: "GitHub Enterprise URL/domain (blank for github.com)",
@@ -459,7 +464,8 @@ async function loginGitHubCopilot(interaction: ProviderAuthInteraction): Promise
 		interaction.signal,
 		{
 			maxRetries: 2,
-			maxElapsedMs: 5000,
+			maxElapsedMs: modelCatalogTimeoutMs,
+			attemptTimeoutMs: modelCatalogTimeoutMs,
 		},
 	);
 	let enabledModelIds: string[] = [];
@@ -484,18 +490,25 @@ function copilotEnterpriseDomain(credential: OAuthCredential): string | undefine
 	return normalizeDomain(enterpriseUrl) ?? undefined;
 }
 
-export const githubCopilotOAuth: OAuthAuth = {
-	name: "GitHub Copilot",
-	isSubscription: true,
-	login: loginGitHubCopilot,
-	refresh: (credential, signal) =>
-		refreshGitHubCopilotToken(credential.refresh, copilotEnterpriseDomain(credential), signal),
+export function createGitHubCopilotOAuth(modelCatalogTimeoutMs: number): OAuthAuth {
+	return {
+		name: "GitHub Copilot",
+		isSubscription: true,
+		login: (interaction) => loginGitHubCopilot(interaction, modelCatalogTimeoutMs),
+		refresh: (credential, signal) =>
+			refreshGitHubCopilotToken(
+				credential.refresh,
+				copilotEnterpriseDomain(credential),
+				signal,
+				modelCatalogTimeoutMs,
+			),
 
-	/** Derive the credential-specific proxy endpoint for each request. */
-	async toAuth(credential) {
-		return {
-			apiKey: credential.access,
-			baseUrl: getGitHubCopilotBaseUrl(credential.access, copilotEnterpriseDomain(credential)),
-		};
-	},
-};
+		/** Derive the credential-specific proxy endpoint for each request. */
+		async toAuth(credential) {
+			return {
+				apiKey: credential.access,
+				baseUrl: getGitHubCopilotBaseUrl(credential.access, copilotEnterpriseDomain(credential)),
+			};
+		},
+	};
+}

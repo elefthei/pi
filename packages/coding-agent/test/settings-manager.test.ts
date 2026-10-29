@@ -410,6 +410,61 @@ describe("SettingsManager", () => {
 		});
 	});
 
+	// Regression: #11549
+	describe.each([
+		{ key: "oauthRefreshTimeoutMs", getter: "getOAuthRefreshTimeoutMs", defaultMs: 15_000 },
+		{ key: "githubCopilotModelsTimeoutMs", getter: "getGitHubCopilotModelsTimeoutMs", defaultMs: 5_000 },
+	] as const)("$key", ({ key, getter, defaultMs }) => {
+		it("defaults only omitted values", () => {
+			expect(SettingsManager.create(projectDir, agentDir)[getter]()).toBe(defaultMs);
+			expect(SettingsManager.inMemory({ [key]: undefined })[getter]()).toBe(defaultMs);
+		});
+
+		it("uses global settings and lets trusted project settings override them", () => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ [key]: 30_000 }));
+			expect(SettingsManager.create(projectDir, agentDir)[getter]()).toBe(30_000);
+
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ [key]: 60_000 }));
+			expect(SettingsManager.create(projectDir, agentDir)[getter]()).toBe(60_000);
+		});
+
+		it("excludes untrusted project values until trust is granted", async () => {
+			writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ [key]: 60_000 }));
+			const manager = SettingsManager.create(projectDir, agentDir, { projectTrusted: false });
+			expect(manager[getter]()).toBe(defaultMs);
+			expect(manager.getProjectSettings()).toEqual({});
+
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ [key]: 30_000 }));
+			await manager.reload();
+			expect(manager[getter]()).toBe(30_000);
+			manager.setProjectTrusted(true);
+			expect(manager[getter]()).toBe(60_000);
+		});
+
+		it.each([null, 0, -1, 0.5, "60000", "disabled", 2147483648])(
+			"rejects malformed loaded JSON value %j at the getter",
+			(value) => {
+				writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ [key]: value }));
+				const manager = SettingsManager.create(projectDir, agentDir);
+				expect(manager.drainErrors()).toEqual([]);
+				expect(() => manager[getter]()).toThrow(
+					new RangeError(`Invalid ${key} setting: expected an integer from 1 to 2147483647 milliseconds`),
+				);
+			},
+		);
+
+		it.each([NaN, Infinity, -Infinity])("rejects non-finite override value %s", (value) => {
+			const manager = SettingsManager.inMemory();
+			manager.applyOverrides({ [key]: value });
+			expect(() => manager[getter]()).toThrow(RangeError);
+		});
+
+		it.each([1, 2147483647])("accepts boundary value %i", (value) => {
+			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ [key]: value }));
+			expect(SettingsManager.create(projectDir, agentDir)[getter]()).toBe(value);
+		});
+	});
+
 	describe("cacheWarming", () => {
 		it("defaults to streaming and ignores project settings", () => {
 			expect(SettingsManager.create(projectDir, agentDir).getCacheWarmingMode()).toBe("streaming");

@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
-import { githubCopilotOAuth } from "../src/auth/oauth/github-copilot.ts";
+import { createGitHubCopilotOAuth } from "../src/auth/oauth/github-copilot.ts";
 import { createModels } from "../src/models.ts";
 import { githubCopilotProvider } from "../src/providers/github-copilot.ts";
 
 const neverAbortedSignal = new AbortController().signal;
+const githubCopilotOAuth = createGitHubCopilotOAuth(5000);
 
 const testCopilotAccessToken = "tid=test;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com;";
 const testCopilotModelsUrl = "https://api.individual.githubcopilot.com/models";
@@ -39,10 +40,10 @@ function requireModelId(models: readonly { id: string }[], index: number): strin
 }
 
 function stubGitHubCopilotLoginFetch(options: {
-	models: () => Response;
-	policy?: (modelId: string) => Response;
+	models: (signal: AbortSignal) => Response | Promise<Response>;
+	policy?: (modelId: string, signal: AbortSignal) => Response | Promise<Response>;
 }): void {
-	const fetchMock = vi.fn(async (input: string | URL | Request): Promise<Response> => {
+	const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
 		const url = getUrl(input);
 		if (url.endsWith("/login/device/code")) {
 			return jsonResponse({
@@ -59,10 +60,13 @@ function stubGitHubCopilotLoginFetch(options: {
 		if (url.includes("/copilot_internal/v2/token")) {
 			return jsonResponse({ token: testCopilotAccessToken, expires_at: 9999999999 });
 		}
-		if (url === testCopilotModelsUrl) return options.models();
+		if (url === testCopilotModelsUrl) return options.models(init?.signal ?? neverAbortedSignal);
 		if (url.startsWith(`${testCopilotModelsUrl}/`) && url.endsWith("/policy")) {
 			if (!options.policy) throw new Error(`Unexpected policy request: ${url}`);
-			return options.policy(url.slice(`${testCopilotModelsUrl}/`.length, -"/policy".length));
+			return options.policy(
+				url.slice(`${testCopilotModelsUrl}/`.length, -"/policy".length),
+				init?.signal ?? neverAbortedSignal,
+			);
 		}
 		throw new Error(`Unexpected fetch URL: ${url}`);
 	});
@@ -79,8 +83,9 @@ function loginGitHubCopilotForTest(options: {
 	onPrompt(prompt: { message: string; placeholder?: string; allowEmpty?: boolean }): Promise<string>;
 	onProgress?(message: string): void;
 	signal?: AbortSignal;
+	modelCatalogTimeoutMs?: number;
 }) {
-	return githubCopilotOAuth.login({
+	return createGitHubCopilotOAuth(options.modelCatalogTimeoutMs ?? 5000).login({
 		signal: options.signal ?? neverAbortedSignal,
 		prompt: (prompt) => {
 			if (prompt.type !== "text") throw new Error(`Unexpected prompt: ${prompt.type}`);
@@ -134,10 +139,306 @@ async function refreshGitHubCopilotModelsForTest(
 	);
 }
 
+function useFakeDeadlineTimers(): void {
+	vi.useFakeTimers();
+	vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+		const controller = new AbortController();
+		setTimeout(() => controller.abort(new DOMException("Deadline exceeded", "TimeoutError")), milliseconds);
+		return controller.signal;
+	});
+}
+
+function delayedCatalogResponse(signal: AbortSignal, delayMs: number, body: unknown): Promise<Response> {
+	return new Promise((resolve, reject) => {
+		signal.throwIfAborted();
+		const abort = () => {
+			clearTimeout(timer);
+			reject(signal.reason);
+		};
+		const timer = setTimeout(() => {
+			signal.removeEventListener("abort", abort);
+			resolve(jsonResponse(body));
+		}, delayMs);
+		signal.addEventListener("abort", abort, { once: true });
+	});
+}
+
+function unfinishedCatalogResponse(signal: AbortSignal): Response {
+	return new Response(
+		new ReadableStream({
+			start(controller) {
+				signal.throwIfAborted();
+				signal.addEventListener("abort", () => controller.error(signal.reason), { once: true });
+			},
+		}),
+		{ headers: { "Content-Type": "application/json" } },
+	);
+}
+
+async function createRefreshingCopilotModels(modelCatalogTimeoutMs?: number) {
+	const credential = {
+		type: "oauth" as const,
+		access: "old-access-token",
+		refresh: "ghu_refresh_token",
+		expires: 0,
+	};
+	const store = new InMemoryCredentialStore();
+	await store.modify("github-copilot", async () => credential);
+	const models = createModels({ credentials: store });
+	models.setProvider(githubCopilotProvider({ modelCatalogTimeoutMs }));
+	return { models, store, credential };
+}
+
+function enabledCatalog() {
+	const modelId = requireModelId(githubCopilotProvider().getModels(), 0);
+	return {
+		data: [
+			{
+				id: modelId,
+				model_picker_enabled: true,
+				policy: { state: "enabled" },
+				capabilities: { supports: { tool_calls: true } },
+			},
+		],
+	};
+}
+
 describe("GitHub Copilot OAuth device flow", () => {
 	afterEach(() => {
+		vi.restoreAllMocks();
 		vi.unstubAllGlobals();
 		vi.useRealTimers();
+	});
+
+	// #11549: catalog deadlines are per provider and include response-body consumption.
+	it("isolates default and configured lazy providers while refreshing expired credentials", async () => {
+		useFakeDeadlineTimers();
+		const catalog = enabledCatalog();
+		let catalogRequests = 0;
+		let bothCatalogsStarted = () => {};
+		const started = new Promise<void>((resolve) => {
+			bothCatalogsStarted = resolve;
+		});
+		stubGitHubCopilotLoginFetch({
+			models: (signal) => {
+				catalogRequests += 1;
+				if (catalogRequests === 2) bothCatalogsStarted();
+				return delayedCatalogResponse(signal, 6000, catalog);
+			},
+		});
+		const defaults = await createRefreshingCopilotModels();
+		const configured = await createRefreshingCopilotModels(60_000);
+		const defaultAuth = defaults.models.getAuth("github-copilot");
+		const defaultFailure = expect(defaultAuth).rejects.toThrow();
+		const configuredAuth = configured.models.getAuth("github-copilot");
+		await started;
+		await vi.advanceTimersByTimeAsync(4999);
+		expect(await defaults.store.read("github-copilot")).toEqual(defaults.credential);
+		expect(await configured.store.read("github-copilot")).toEqual(configured.credential);
+		await vi.advanceTimersByTimeAsync(1);
+		await defaultFailure;
+		expect(await defaults.store.read("github-copilot")).toEqual(defaults.credential);
+		await vi.advanceTimersByTimeAsync(1000);
+		await expect(configuredAuth).resolves.toBeDefined();
+		expect(await configured.store.read("github-copilot")).toMatchObject({
+			access: testCopilotAccessToken,
+			availableModelIds: catalog.data.map((model) => model.id),
+		});
+		expect(catalogRequests).toBe(2);
+	});
+
+	it("aborts an unfinished catalog body without publishing refreshed credentials", async () => {
+		useFakeDeadlineTimers();
+		let catalogSignal: AbortSignal | undefined;
+		let catalogStarted = () => {};
+		const started = new Promise<void>((resolve) => {
+			catalogStarted = resolve;
+		});
+		stubGitHubCopilotLoginFetch({
+			models: (signal) => {
+				catalogSignal = signal;
+				catalogStarted();
+				return unfinishedCatalogResponse(signal);
+			},
+		});
+		const { models, store, credential } = await createRefreshingCopilotModels(25);
+		const failure = expect(models.getAuth("github-copilot")).rejects.toThrow();
+		await started;
+		await vi.advanceTimersByTimeAsync(24);
+		expect(catalogSignal?.aborted).toBe(false);
+		await vi.advanceTimersByTimeAsync(1);
+		await failure;
+		expect(catalogSignal?.aborted).toBe(true);
+		expect(await store.read("github-copilot")).toEqual(credential);
+	});
+
+	it.each([null, 0, -1, 0.5, "60000", "disabled", NaN, Infinity, 2_147_483_648])(
+		"rejects invalid provider catalog timeout %s before any request",
+		(value) => {
+			const fetchMock = vi.fn();
+			vi.stubGlobal("fetch", fetchMock);
+			expect(() => githubCopilotProvider({ modelCatalogTimeoutMs: value as number })).toThrow(RangeError);
+			expect(fetchMock).not.toHaveBeenCalled();
+		},
+	);
+
+	it("allows login catalogs completing after the former five-second budget", async () => {
+		useFakeDeadlineTimers();
+		const catalog = enabledCatalog();
+		stubGitHubCopilotLoginFetch({ models: (signal) => delayedCatalogResponse(signal, 6000, catalog) });
+		const login = loginGitHubCopilotForTest({
+			onDeviceCode: () => {},
+			onPrompt: async () => "",
+			modelCatalogTimeoutMs: 60_000,
+		});
+		await vi.advanceTimersByTimeAsync(6999);
+		await vi.advanceTimersByTimeAsync(1);
+		await expect(login).resolves.toMatchObject({
+			access: testCopilotAccessToken,
+			availableModelIds: catalog.data.map((model) => model.id),
+		});
+	});
+
+	it("allows a login catalog retry after a delay beyond five seconds", async () => {
+		useFakeDeadlineTimers();
+		const catalog = enabledCatalog();
+		let catalogRequests = 0;
+		stubGitHubCopilotLoginFetch({
+			models: () => {
+				catalogRequests += 1;
+				return catalogRequests === 1
+					? jsonResponse({ error: "throttled" }, 429, { "Retry-After": "6" })
+					: jsonResponse(catalog);
+			},
+		});
+		const login = loginGitHubCopilotForTest({
+			onDeviceCode: () => {},
+			onPrompt: async () => "",
+			modelCatalogTimeoutMs: 60_000,
+		});
+		await vi.advanceTimersByTimeAsync(6999);
+		expect(catalogRequests).toBe(1);
+		await vi.advanceTimersByTimeAsync(1);
+		await expect(login).resolves.toMatchObject({ availableModelIds: catalog.data.map((model) => model.id) });
+		expect(catalogRequests).toBe(2);
+	});
+
+	it("does not retry a login catalog when Retry-After exceeds its configured budget", async () => {
+		useFakeDeadlineTimers();
+		let catalogRequests = 0;
+		stubGitHubCopilotLoginFetch({
+			models: () => {
+				catalogRequests += 1;
+				return jsonResponse({ error: "throttled" }, 429, { "Retry-After": "0.1" });
+			},
+		});
+		const failure = expect(
+			loginGitHubCopilotForTest({
+				onDeviceCode: () => {},
+				onPrompt: async () => "",
+				modelCatalogTimeoutMs: 25,
+			}),
+		).rejects.toThrow("429");
+		await vi.advanceTimersByTimeAsync(1000);
+		await failure;
+		expect(catalogRequests).toBe(1);
+	});
+
+	it("keeps login catalog retries capped at two with a larger budget", async () => {
+		useFakeDeadlineTimers();
+		let catalogRequests = 0;
+		stubGitHubCopilotLoginFetch({
+			models: () => {
+				catalogRequests += 1;
+				return jsonResponse({ error: "throttled" }, 429, { "Retry-After": "0" });
+			},
+		});
+		const failure = expect(
+			loginGitHubCopilotForTest({
+				onDeviceCode: () => {},
+				onPrompt: async () => "",
+				modelCatalogTimeoutMs: 60_000,
+			}),
+		).rejects.toThrow("429");
+		await vi.advanceTimersByTimeAsync(1005);
+		await failure;
+		expect(catalogRequests).toBe(3);
+	});
+
+	it("bounds login error-body reading by the configured catalog deadline", async () => {
+		useFakeDeadlineTimers();
+		let catalogSignal: AbortSignal | undefined;
+		stubGitHubCopilotLoginFetch({
+			models: (signal) => {
+				catalogSignal = signal;
+				const response = unfinishedCatalogResponse(signal);
+				return new Response(response.body, { status: 429, headers: { "Retry-After": "1" } });
+			},
+		});
+		const failure = expect(
+			loginGitHubCopilotForTest({
+				onDeviceCode: () => {},
+				onPrompt: async () => "",
+				modelCatalogTimeoutMs: 25,
+			}),
+		).rejects.toThrow();
+		await vi.advanceTimersByTimeAsync(1024);
+		expect(catalogSignal?.aborted).toBe(false);
+		await vi.advanceTimersByTimeAsync(1);
+		await failure;
+		expect(catalogSignal?.aborted).toBe(true);
+	});
+
+	it("immediately aborts an in-flight login catalog when its caller cancels", async () => {
+		useFakeDeadlineTimers();
+		const controller = new AbortController();
+		let catalogSignal: AbortSignal | undefined;
+		stubGitHubCopilotLoginFetch({
+			models: (signal) => {
+				catalogSignal = signal;
+				return delayedCatalogResponse(signal, 6000, enabledCatalog());
+			},
+		});
+		const failure = expect(
+			loginGitHubCopilotForTest({
+				onDeviceCode: () => {},
+				onPrompt: async () => "",
+				modelCatalogTimeoutMs: 60_000,
+				signal: controller.signal,
+			}),
+		).rejects.toThrow("Login cancelled");
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(catalogSignal?.aborted).toBe(false);
+		controller.abort(new Error("Login cancelled"));
+		await failure;
+		expect(catalogSignal?.aborted).toBe(true);
+	});
+
+	it("keeps policy attempts at five seconds with a larger catalog deadline", async () => {
+		useFakeDeadlineTimers();
+		const catalog = enabledCatalog();
+		for (const model of catalog.data) model.policy.state = "unconfigured";
+		let policySignal: AbortSignal | undefined;
+		let policyRequests = 0;
+		stubGitHubCopilotLoginFetch({
+			models: () => jsonResponse(catalog),
+			policy: (_modelId, signal) => {
+				policyRequests += 1;
+				policySignal = signal;
+				return delayedCatalogResponse(signal, 6000, {});
+			},
+		});
+		const login = loginGitHubCopilotForTest({
+			onDeviceCode: () => {},
+			onPrompt: async () => "",
+			modelCatalogTimeoutMs: 60_000,
+		});
+		await vi.advanceTimersByTimeAsync(5999);
+		expect(policySignal?.aborted).toBe(false);
+		await vi.advanceTimersByTimeAsync(1);
+		await expect(login).resolves.toMatchObject({ access: testCopilotAccessToken });
+		expect(policySignal?.aborted).toBe(true);
+		expect(policyRequests).toBe(1);
 	});
 
 	it("filters models to the authenticated account picker catalog", async () => {
@@ -247,7 +548,7 @@ describe("GitHub Copilot OAuth device flow", () => {
 		);
 
 		await expect(
-			githubCopilotOAuth.refresh(
+			createGitHubCopilotOAuth(60_000).refresh(
 				{
 					type: "oauth",
 					access: "old-access-token",

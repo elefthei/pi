@@ -416,6 +416,23 @@ export const SettingsSchema = Type.Object(
 				description: 'WebSocket connect or open handshake timeout in milliseconds; 0 or "disabled" disables it.',
 			}),
 		),
+		oauthRefreshTimeoutMs: Type.Optional(
+			Type.Integer({
+				description: "OAuth refresh deadline in milliseconds, captured when the model runtime is constructed.",
+				minimum: 1,
+				maximum: 2147483647,
+				default: SETTINGS_DEFAULTS.oauthRefreshTimeoutMs,
+			}),
+		),
+		githubCopilotModelsTimeoutMs: Type.Optional(
+			Type.Integer({
+				description:
+					"GitHub Copilot model catalog deadline in milliseconds, captured when the model runtime is constructed.",
+				minimum: 1,
+				maximum: 2147483647,
+				default: SETTINGS_DEFAULTS.githubCopilotModelsTimeoutMs,
+			}),
+		),
 		tuiMode: Type.Optional(
 			Type.Union([Type.Literal("regular"), Type.Literal("fullscreen")], {
 				default: SETTINGS_DEFAULTS.tuiMode,

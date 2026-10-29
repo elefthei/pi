@@ -1,7 +1,16 @@
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { type AuthType, type CredentialStore, InMemoryCredentialStore } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { githubCopilotProvider } from "@earendil-works/pi-ai/providers/github-copilot";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createAgentSessionServices } from "../src/core/agent-session-services.ts";
 import { AuthStorage } from "../src/core/auth-storage.ts";
-import { ModelRuntime } from "../src/core/model-runtime.ts";
+import { type CreateModelRuntimeOptions, ModelRuntime } from "../src/core/model-runtime.ts";
+import { DefaultResourceLoader } from "../src/core/resource-loader.ts";
+import { createAgentSession } from "../src/core/sdk.ts";
+import { SessionManager } from "../src/core/session-manager.ts";
+import { InMemorySettingsStorage, SettingsManager } from "../src/core/settings-manager.ts";
 
 function authOptions(runtime: ModelRuntime, type?: AuthType) {
 	return runtime
@@ -322,5 +331,327 @@ describe("ModelRuntime auth options", () => {
 			provider: { id: "extension-oauth", name: "Extension OAuth" },
 			method: { name: "Extension subscription", isSubscription: true },
 		});
+	});
+});
+
+// #11549: exercise captured SDK deadlines through the real lazy OAuth provider and credential store.
+describe("ModelRuntime OAuth and Copilot deadlines", () => {
+	const cleanups: Array<() => void> = [];
+	const expiredCredential = { type: "oauth" as const, access: "expired", refresh: "synthetic-refresh", expires: 0 };
+	const accessToken = "tid=test;exp=9999999999;proxy-ep=proxy.individual.githubcopilot.com;";
+	const configuredTimeouts = { oauthRefreshTimeoutMs: 30_000, githubCopilotModelsTimeoutMs: 60_000 };
+	const resourceLoaderOptions = {
+		noExtensions: true,
+		noSkills: true,
+		noPromptTemplates: true,
+		noThemes: true,
+		noContextFiles: true,
+	};
+	const scenarios = [
+		{ name: "OAuth refresh", tokenDelayMs: 16_000, catalogDelayMs: 0, defaultDeadlineMs: 15_000 },
+		{ name: "Copilot catalog", tokenDelayMs: 0, catalogDelayMs: 6000, defaultDeadlineMs: 5000 },
+	];
+
+	beforeEach(() => {
+		vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Unexpected fetch during fixture construction")));
+	});
+
+	afterEach(() => {
+		while (cleanups.length > 0) cleanups.pop()?.();
+		vi.restoreAllMocks();
+		vi.unstubAllGlobals();
+		vi.useRealTimers();
+	});
+
+	function temporaryDirectory(): string {
+		const directory = mkdtempSync(join(tmpdir(), "pi-runtime-deadlines-"));
+		cleanups.push(() => rmSync(directory, { recursive: true, force: true }));
+		return directory;
+	}
+
+	function useFakeDeadlineTimers(): void {
+		vi.useFakeTimers();
+		vi.spyOn(AbortSignal, "timeout").mockImplementation((milliseconds) => {
+			const controller = new AbortController();
+			setTimeout(() => controller.abort(new DOMException("Deadline exceeded", "TimeoutError")), milliseconds);
+			return controller.signal;
+		});
+	}
+
+	function delayedResponse(body: unknown, signal: AbortSignal, delayMs: number): Promise<Response> {
+		const response = () => new Response(JSON.stringify(body), { headers: { "Content-Type": "application/json" } });
+		signal.throwIfAborted();
+		if (delayMs === 0) return Promise.resolve(response());
+		return new Promise((resolve, reject) => {
+			const abort = () => {
+				clearTimeout(timer);
+				reject(signal.reason);
+			};
+			const timer = setTimeout(() => {
+				signal.removeEventListener("abort", abort);
+				resolve(response());
+			}, delayMs);
+			signal.addEventListener("abort", abort, { once: true });
+		});
+	}
+
+	function stubCopilotFetch(tokenDelayMs: number, catalogDelayMs: number, expectedStarts = 1) {
+		const modelId = githubCopilotProvider().getModels()[0]?.id;
+		if (!modelId) throw new Error("Expected a built-in Copilot model");
+		let starts = 0;
+		let markStarted = () => {};
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const fetchMock = vi.fn((input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+			const url = input instanceof Request ? input.url : String(input);
+			const signal = init?.signal;
+			if (!signal) throw new Error("Expected an OAuth-owned request signal");
+			if (url.includes("/copilot_internal/v2/token")) {
+				if (tokenDelayMs > 0 && ++starts === expectedStarts) markStarted();
+				return delayedResponse({ token: accessToken, expires_at: 9999999999 }, signal, tokenDelayMs);
+			}
+			if (url === "https://api.individual.githubcopilot.com/models") {
+				if (tokenDelayMs === 0 && ++starts === expectedStarts) markStarted();
+				return delayedResponse(
+					{
+						data: [
+							{
+								id: modelId,
+								model_picker_enabled: true,
+								policy: { state: "enabled" },
+								capabilities: { supports: { tool_calls: true } },
+							},
+						],
+					},
+					signal,
+					catalogDelayMs,
+				);
+			}
+			throw new Error(`Unexpected fetch URL: ${url}`);
+		});
+		vi.stubGlobal("fetch", fetchMock);
+		return { started, modelId, fetchMock };
+	}
+
+	async function createRuntime(options: CreateModelRuntimeOptions = {}) {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("github-copilot", async () => expiredCredential);
+		const runtime = await ModelRuntime.create({
+			credentials,
+			modelsPath: null,
+			allowModelNetwork: false,
+			refreshOnCreate: false,
+			...options,
+		});
+		return { runtime, credentials };
+	}
+
+	async function createServices(settingsManager: SettingsManager, modelRuntime?: ModelRuntime) {
+		const agentDir = temporaryDirectory();
+		const credentials = AuthStorage.inMemory();
+		if (!modelRuntime) vi.spyOn(AuthStorage, "create").mockReturnValueOnce(credentials);
+		const services = await createAgentSessionServices({
+			cwd: agentDir,
+			agentDir,
+			settingsManager,
+			modelRuntime,
+			resourceLoaderOptions,
+		});
+		// Seed after construction so startup availability checks cannot consume the test refresh.
+		if (!modelRuntime) await credentials.modify("github-copilot", async () => expiredCredential);
+		return { ...services, runtime: services.modelRuntime, credentials };
+	}
+
+	async function createSession(settingsManager: SettingsManager, modelRuntime?: ModelRuntime) {
+		const agentDir = temporaryDirectory();
+		const credentials = AuthStorage.inMemory();
+		if (!modelRuntime) vi.spyOn(AuthStorage, "create").mockReturnValueOnce(credentials);
+		const resourceLoader = new DefaultResourceLoader({
+			cwd: agentDir,
+			agentDir,
+			settingsManager,
+			...resourceLoaderOptions,
+		});
+		await resourceLoader.reload();
+		const { session } = await createAgentSession({
+			cwd: agentDir,
+			agentDir,
+			settingsManager,
+			modelRuntime,
+			resourceLoader,
+			sessionManager: SessionManager.inMemory(agentDir),
+			tools: [],
+		});
+		cleanups.push(() => session.dispose());
+		if (!modelRuntime) await credentials.modify("github-copilot", async () => expiredCredential);
+		return { runtime: session.modelRuntime, credentials };
+	}
+
+	function authOutcome(runtime: ModelRuntime) {
+		return runtime.getAuth("github-copilot").then(
+			(auth) => ({ auth }),
+			(error: unknown) => ({ error }),
+		);
+	}
+
+	async function expectCapturedDeadlines(
+		defaults: { runtime: ModelRuntime; credentials: CredentialStore },
+		configured: { runtime: ModelRuntime; credentials: CredentialStore },
+		scenario: (typeof scenarios)[number],
+	) {
+		expect(fetch).not.toHaveBeenCalled();
+		expect(await defaults.credentials.read("github-copilot")).toEqual(expiredCredential);
+		expect(await configured.credentials.read("github-copilot")).toEqual(expiredCredential);
+		useFakeDeadlineTimers();
+		const { started, modelId } = stubCopilotFetch(scenario.tokenDelayMs, scenario.catalogDelayMs, 2);
+		let defaultSettled = false;
+		let configuredSettled = false;
+		const defaultAuth = authOutcome(defaults.runtime).then((outcome) => {
+			defaultSettled = true;
+			return outcome;
+		});
+		const configuredAuth = authOutcome(configured.runtime).then((outcome) => {
+			configuredSettled = true;
+			return outcome;
+		});
+		await started;
+		await vi.advanceTimersByTimeAsync(scenario.defaultDeadlineMs - 1);
+		expect(defaultSettled).toBe(false);
+		// AuthStorage reads also take the lock held by the pending refresh.
+		expect(configuredSettled).toBe(false);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(await defaultAuth).toHaveProperty("error");
+		expect(await defaults.credentials.read("github-copilot")).toEqual(expiredCredential);
+		await vi.advanceTimersByTimeAsync(1000);
+		expect(await configuredAuth).toMatchObject({ auth: { auth: { apiKey: accessToken } } });
+		expect(await configured.credentials.read("github-copilot")).toMatchObject({
+			access: accessToken,
+			availableModelIds: [modelId],
+		});
+	}
+
+	it.each(scenarios)("captures independent constructor limits for $name", async (scenario) => {
+		const defaults = await createRuntime();
+		const configured = await createRuntime(configuredTimeouts);
+		await expectCapturedDeadlines(defaults, configured, scenario);
+	});
+
+	for (const [name, create] of [
+		["session services", createServices],
+		["SDK session", createSession],
+	] as const) {
+		it.each(scenarios)(`applies in-memory settings to default-created ${name} for $name`, async (scenario) => {
+			const defaults = await create(SettingsManager.inMemory());
+			const configured = await create(SettingsManager.inMemory(configuredTimeouts));
+			await expectCapturedDeadlines(defaults, configured, scenario);
+		});
+
+		it.each(
+			(["invalid", "shorter", "longer"] as const).flatMap((settingKind) =>
+				scenarios.map((scenario) => ({ ...scenario, settingKind })),
+			),
+		)(
+			`keeps an explicit $name limit authoritative in ${name} with $settingKind session settings`,
+			async ({ settingKind, tokenDelayMs, catalogDelayMs, defaultDeadlineMs }) => {
+				const explicit = await createRuntime(settingKind === "longer" ? {} : configuredTimeouts);
+				const settingsManager = SettingsManager.inMemory(
+					settingKind === "invalid"
+						? { oauthRefreshTimeoutMs: null as unknown as number, githubCopilotModelsTimeoutMs: 0 }
+						: settingKind === "shorter"
+							? { oauthRefreshTimeoutMs: 1, githubCopilotModelsTimeoutMs: 1 }
+							: configuredTimeouts,
+				);
+				const created = await create(settingsManager, explicit.runtime);
+				expect(created.runtime).toBe(explicit.runtime);
+				expect(fetch).not.toHaveBeenCalled();
+				useFakeDeadlineTimers();
+				const { started, modelId } = stubCopilotFetch(tokenDelayMs, catalogDelayMs);
+				const outcome = authOutcome(created.runtime);
+				await started;
+				await vi.advanceTimersByTimeAsync(
+					settingKind === "longer" ? defaultDeadlineMs : tokenDelayMs + catalogDelayMs,
+				);
+				if (settingKind === "longer") {
+					expect(await outcome).toHaveProperty("error");
+					expect(await explicit.credentials.read("github-copilot")).toEqual(expiredCredential);
+				} else {
+					expect(await outcome).toMatchObject({ auth: { auth: { apiKey: accessToken } } });
+					expect(await explicit.credentials.read("github-copilot")).toMatchObject({
+						access: accessToken,
+						availableModelIds: [modelId],
+					});
+				}
+			},
+		);
+	}
+
+	for (const change of ["reload", "project trust admission"] as const) {
+		it.each(scenarios)(`captures $name until a new runtime is constructed after ${change}`, async (scenario) => {
+			const storage = new InMemorySettingsStorage();
+			if (change === "project trust admission") {
+				storage.withLock("project", () => JSON.stringify(configuredTimeouts));
+			}
+			const settingsManager = SettingsManager.fromStorage(storage, { projectTrusted: false });
+			const original = await createServices(settingsManager);
+			if (change === "reload") {
+				storage.withLock("global", () => JSON.stringify(configuredTimeouts));
+				await original.resourceLoader.reload();
+			} else {
+				await original.resourceLoader.reload({ resolveProjectTrust: async () => true });
+				expect(settingsManager.isProjectTrusted()).toBe(true);
+			}
+			expect(settingsManager.getOAuthRefreshTimeoutMs()).toBe(30_000);
+			expect(settingsManager.getGitHubCopilotModelsTimeoutMs()).toBe(60_000);
+			const reconstructed = await createServices(settingsManager);
+			await expectCapturedDeadlines(original, reconstructed, scenario);
+		});
+	}
+
+	for (const key of ["oauthRefreshTimeoutMs", "githubCopilotModelsTimeoutMs"] as const) {
+		it.each([null, 0, -1, 0.5, "60000", "disabled", NaN, Infinity, 2_147_483_648])(
+			`rejects invalid ${key} %s before provider calls or storage access`,
+			async (value) => {
+				const credentials = new InMemoryCredentialStore();
+				const storageCalls = [
+					vi.spyOn(credentials, "read"),
+					vi.spyOn(credentials, "list"),
+					vi.spyOn(credentials, "modify"),
+					vi.spyOn(credentials, "delete"),
+				];
+				const directory = temporaryDirectory();
+				const authPath = join(directory, "uncreated", "auth.json");
+				const fetchMock = vi.fn();
+				vi.stubGlobal("fetch", fetchMock);
+				await expect(
+					ModelRuntime.create({ credentials, authPath, modelsPath: null, [key]: value as number }),
+				).rejects.toThrow(new RangeError(`Invalid ${key}: expected an integer from 1 to 2147483647 milliseconds`));
+				await expect(ModelRuntime.create({ authPath, modelsPath: null, [key]: value as number })).rejects.toThrow(
+					RangeError,
+				);
+				for (const call of storageCalls) expect(call).not.toHaveBeenCalled();
+				expect(fetchMock).not.toHaveBeenCalled();
+				expect(existsSync(join(directory, "uncreated"))).toBe(false);
+			},
+		);
+	}
+
+	it.each([1, 2_147_483_647])("accepts and applies the timeout boundary %i", async (timeout) => {
+		const { runtime, credentials } = await createRuntime({
+			oauthRefreshTimeoutMs: timeout,
+			githubCopilotModelsTimeoutMs: timeout,
+		});
+		useFakeDeadlineTimers();
+		const { started, modelId } = stubCopilotFetch(0, 2);
+		const outcome = authOutcome(runtime);
+		await started;
+		await vi.advanceTimersByTimeAsync(2);
+		if (timeout === 1) {
+			expect(await outcome).toHaveProperty("error");
+			expect(await credentials.read("github-copilot")).toEqual(expiredCredential);
+		} else {
+			expect(await outcome).toMatchObject({ auth: { auth: { apiKey: accessToken } } });
+			expect(await credentials.read("github-copilot")).toMatchObject({ availableModelIds: [modelId] });
+		}
 	});
 });

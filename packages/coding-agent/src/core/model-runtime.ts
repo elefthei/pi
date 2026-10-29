@@ -59,6 +59,7 @@ import {
 } from "@earendil-works/pi-ai";
 import * as builtinProviderCatalog from "@earendil-works/pi-ai/providers/all";
 import { personalizeOpenRouterCatalog } from "@earendil-works/pi-ai/providers/openrouter";
+import { validateTimeoutMs } from "@earendil-works/pi-ai/utils/abort";
 import {
 	assertChatModel,
 	assertClassifierInputSupported,
@@ -118,6 +119,10 @@ export interface CreateModelRuntimeOptions {
 	allowModelNetwork?: boolean;
 	/** Timeout for the create-time network model refresh. */
 	modelRefreshTimeoutMs?: number;
+	/** Deadline for each started OAuth refresh; defaults to 15 seconds. */
+	oauthRefreshTimeoutMs?: number;
+	/** Deadline for Copilot catalog requests and response bodies; defaults to five seconds. */
+	githubCopilotModelsTimeoutMs?: number;
 	catalogBaseUrl?: string;
 	/** Optional caller cancellation for initial cache restoration and availability checks. */
 	signal?: AbortSignal;
@@ -204,6 +209,7 @@ export class ModelRuntime implements Models {
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
+		oauthRefreshTimeoutMs: number | undefined,
 	) {
 		this.credentials = credentials;
 		this.config = config;
@@ -211,11 +217,17 @@ export class ModelRuntime implements Models {
 		this.modelNetworkEnabled = modelNetworkEnabled;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
-		this.models = createModels({ credentials, modelsStore });
+		this.models = createModels({ credentials, modelsStore, oauthRefreshTimeoutMs });
 		this.rebuildProviders();
 	}
 
 	static async create(options: CreateModelRuntimeOptions = {}): Promise<ModelRuntime> {
+		if (options.oauthRefreshTimeoutMs !== undefined) {
+			validateTimeoutMs(options.oauthRefreshTimeoutMs, "oauthRefreshTimeoutMs");
+		}
+		if (options.githubCopilotModelsTimeoutMs !== undefined) {
+			validateTimeoutMs(options.githubCopilotModelsTimeoutMs, "githubCopilotModelsTimeoutMs");
+		}
 		const credentials = new RuntimeCredentials(options.credentials ?? DefaultAuthStorage.create(options.authPath));
 		const modelsPath =
 			options.modelsPath === null ? undefined : (options.modelsPath ?? join(getAgentDir(), "models.json"));
@@ -226,19 +238,23 @@ export class ModelRuntime implements Models {
 				? new FileModelsStore(options.modelsStorePath ?? join(dirname(modelsPath), "models-store.json"))
 				: new InMemoryCodingAgentModelsStore());
 		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
-		const providers = builtinProviderCatalog.builtinProviders().map((provider) => {
-			if (provider.id === "radius") return provider;
-			// OpenRouter narrows the catalog to the models, limits and prices of the user's key.
-			if (provider.id === "openrouter") {
-				return withPersonalizedCatalog(
-					provider,
-					personalizeOpenRouterCatalog,
-					options.catalogBaseUrl,
-					builtinModelDataGeneratedAt,
-				);
-			}
-			return withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt);
-		});
+		const providers = builtinProviderCatalog
+			.builtinProviders({
+				githubCopilot: { modelCatalogTimeoutMs: options.githubCopilotModelsTimeoutMs },
+			})
+			.map((provider) => {
+				if (provider.id === "radius") return provider;
+				// OpenRouter narrows the catalog to the models, limits and prices of the user's key.
+				if (provider.id === "openrouter") {
+					return withPersonalizedCatalog(
+						provider,
+						personalizeOpenRouterCatalog,
+						options.catalogBaseUrl,
+						builtinModelDataGeneratedAt,
+					);
+				}
+				return withRemoteCatalog(provider, options.catalogBaseUrl, builtinModelDataGeneratedAt);
+			});
 		const runtime = new ModelRuntime(
 			credentials,
 			config,
@@ -246,6 +262,7 @@ export class ModelRuntime implements Models {
 			modelsStore,
 			providers,
 			process.env.PI_OFFLINE === undefined,
+			options.oauthRefreshTimeoutMs,
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();

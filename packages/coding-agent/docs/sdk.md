@@ -107,6 +107,22 @@ Each boundary can be supplied explicitly:
 
 Use `DefaultResourceLoader` when you want standard discovery with selected overrides. Supply a custom `ResourceLoader` when the host owns resource storage and discovery completely.
 
+OAuth refresh and Copilot catalog deadlines can be set when constructing a runtime:
+
+```typescript
+import { createAgentSession, ModelRuntime } from "@earendil-works/pi-coding-agent";
+
+const modelRuntime = await ModelRuntime.create({
+  oauthRefreshTimeoutMs: 90_000,
+  githubCopilotModelsTimeoutMs: 60_000,
+});
+await createAgentSession({ modelRuntime });
+```
+
+The defaults remain `15_000` and `5_000` milliseconds. Explicit values must be integers from `1` to `2147483647`. The OAuth limit also covers token exchange, so it may need to exceed the catalog limit. `modelRefreshTimeoutMs` independently bounds only create-time catalog refresh.
+
+A default-created session can instead receive `SettingsManager.inMemory({ oauthRefreshTimeoutMs: 90_000, githubCopilotModelsTimeoutMs: 60_000 })` as `settingsManager`. An explicitly supplied `modelRuntime` retains its own limits; session settings do not reconfigure it. Settings reloads and later project-trust grants likewise leave an existing runtime unchanged. Construct a new runtime to apply new values. Cancelling a caller stops waiting but does not interrupt a started OAuth refresh's token persistence before its own deadline.
+
 <a id="inlineextension"></a>
 
 Inline extension factories can be supplied through `DefaultResourceLoader`. Give one an `InlineExtension` name only when it needs a stable name in diagnostics and startup output. A named inline extension with `replaceable: true` is left out when another extension registers a tool, command, or flag with a name it registers during loading, instead of both loading with a conflict. The CLI's built-in codemode, tool search, and MCP extensions are replaceable. A named entry with `builtin: true` is not an inline extension: it supplies the code of the `builtin:<name>` extension, which loads like a configured extension file. It loads by default, is listed in `pi config`, and is disabled by `-builtin:<name>` in the `extensions` setting or by `noExtensions`; `additionalExtensionPaths: ["builtin:<name>"]` loads it explicitly. It loads after project trust is resolved, so it cannot handle `project_trust`. The CLI's built-in extensions use it.
